@@ -1,0 +1,4 @@
+# Nothing here should ever contain real credentials. Local test scratch only.
+*.log
+SHA256SUMS
+.DS_Store

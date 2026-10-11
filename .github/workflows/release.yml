@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches both script versions
+        run: |
+          sh_version="$(sed -n 's/^FI_VERSION="\(.*\)"$/\1/p' install.sh)"
+          ps_version="$(sed -n "s/^\$FiVersion = '\(.*\)'\$/\1/p" install.ps1)"
+          if [ "v$sh_version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME != FI_VERSION=$sh_version in install.sh" >&2; exit 1
+          fi
+          if [ "v$ps_version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME != \$FiVersion=$ps_version in install.ps1" >&2; exit 1
+          fi
+
+      - name: Test
+        run: bash tests/run.sh
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shasum -a 256 install.sh install.ps1 > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" install.sh install.ps1 SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --generate-notes
