@@ -50,6 +50,12 @@ class H(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"access_token":"t","token_type":"Bearer","expires_in":3600}')
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b'{"message":"Not found"}')
+    def do_GET(self):
+        if self.path.startswith('/api/4.0/user') and self.headers.get('Authorization') == 'token t':
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b'{"id":43,"display_name":"Test"}')
+        else:
+            self.send_response(404); self.end_headers(); self.wfile.write(b'{"message":"Not found"}')
     def log_message(self, *a): pass
 http.server.HTTPServer(('127.0.0.1', $PORT), H).serve_forever()
 EOF
@@ -131,6 +137,7 @@ check "desktop config kept other settings" 'desktop_json | grep -q "globalShortc
 check "desktop config was backed up" '[ -f "$HOME_DIR/Library/Application Support/Claude/claude_desktop_config.json.bak-foreman-intelligence" ]'
 check "Claude Code skill installed" '[ -f "$HOME_DIR/.claude/skills/foreman-intelligence/SKILL.md" ]'
 check "secret never printed" '! grep -qF "s3cret" "$WORK/out.txt"'
+check "prints direct API-key URL with resolved id" 'grep -q "admin/next/users/api3_key/43" "$WORK/out.txt"'
 
 echo "Re-run repairs without re-downloading"
 if run_installer --target both; then ok "second run exits 0"; else bad "second run exits 0"; cat "$WORK/out.txt"; fi

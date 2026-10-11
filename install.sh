@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-FI_VERSION="0.1.0"
+FI_VERSION="0.1.1"
 
 TOOLBOX_VERSION="1.13.1"
 # Published by Google in the v1.13.1 release notes (googleapis/mcp-toolbox).
@@ -431,6 +431,28 @@ saved_client_id() {
     [ -n "$line" ] && printf '%s' "$line"
 }
 
+# Echoes the authenticated user's numeric Looker id, or nothing on failure.
+# Used to deep-link to that user's own API-key admin page, which is keyed by id.
+looker_user_id() {
+    local id="$1" secret="$2" tok
+    tok="$(printf 'client_id=%s&client_secret=%s' "$(urlencode "$id")" "$(urlencode "$secret")" \
+        | curl -sS --max-time 20 -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-binary @- "$FI_BASE_URL/api/4.0/login" 2>/dev/null \
+        | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')"
+    [ -n "$tok" ] || return 1
+    curl -sS --max-time 20 -H "Authorization: token $tok" "$FI_BASE_URL/api/4.0/user?fields=id" 2>/dev/null \
+        | sed -n 's/.*"id" *: *\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# The user's own API-key page when we can resolve their id, else the
+# self-service account page (no id, works for everyone).
+apikey_url() {
+    local id="$1" secret="$2" uid
+    uid="$(looker_user_id "$id" "$secret" 2>/dev/null || true)"
+    if [ -n "$uid" ]; then printf '%s/admin/next/users/api3_key/%s' "$FI_BASE_URL" "$uid"
+    else printf '%s/account' "$FI_BASE_URL"; fi
+}
+
 collect_credentials() {
     step "Connecting your Foreman Intelligence account"
 
@@ -464,17 +486,23 @@ collect_credentials() {
 
   ${C_BOLD}In the page that opens:${C_NC}
     1. Sign in if asked
-    2. Authentication section → ${C_BOLD}Manage${C_NC} (API keys)
+    2. Find the API keys / Authentication section (click ${C_BOLD}Manage${C_NC} if shown)
     3. ${C_BOLD}Create a new API key${C_NC}, then copy the Client ID and Client Secret
 
-  No "Manage" button? Your account can't create API keys yet. Ask your
+  No API-key option? Your account can't create API keys yet. Ask your
   Foreman Intelligence admin, then run this installer again.
 
 EOF
+    # Deep-link to this user's own API-key page when a prior key can resolve
+    # their id; otherwise the self-service account page.
+    local open_url="$FI_BASE_URL/account" prev_id prev_secret
+    prev_id="$(saved_client_id 2>/dev/null || true)"
+    prev_secret="$(keychain_read 2>/dev/null || true)"
+    if [ -n "$prev_id" ] && [ -n "$prev_secret" ]; then open_url="$(apikey_url "$prev_id" "$prev_secret")"; fi
     # shellcheck disable=SC2034 # assigned by ask via printf -v
     local ignored=""
     ask ignored "  Press Enter to open Foreman Intelligence in your browser... "
-    open "$FI_BASE_URL/account" >/dev/null 2>&1 || log_warn "Couldn't open a browser. Go to $FI_BASE_URL/account"
+    open "$open_url" >/dev/null 2>&1 || log_warn "Couldn't open a browser. Go to $open_url"
 
     local attempt=1 id secret
     while [ $attempt -le 3 ]; do
@@ -708,6 +736,11 @@ finish() {
     fi
     if [ "$WANT_DESKTOP" = true ]; then
         printf '  Claude Desktop: open a new chat.\n'
+    fi
+    local uid
+    uid="$(looker_user_id "$CLIENT_ID" "$CLIENT_SECRET" 2>/dev/null || true)"
+    if [ -n "$uid" ]; then
+        printf '\n  Manage or rotate this key anytime:\n    %s/admin/next/users/api3_key/%s\n' "$FI_BASE_URL" "$uid"
     fi
     printf '\n  %sSomething off later? Run the same install command again; it repairs itself.%s\n' "$C_DIM" "$C_NC"
     printf '  %sNew API key: add --reconfigure. Remove everything: add --uninstall.%s\n\n' "$C_DIM" "$C_NC"

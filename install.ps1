@@ -36,7 +36,7 @@ Set-StrictMode -Version 2.0
 # Windows PowerShell 5.1, especially when stdout is redirected.
 $ProgressPreference = 'SilentlyContinue'
 
-$FiVersion = '0.1.0'
+$FiVersion = '0.1.1'
 
 $ToolboxVersion = '1.13.1'
 # Published by Google in the v1.13.1 release notes (googleapis/mcp-toolbox).
@@ -274,6 +274,29 @@ function Get-SavedClientId {
     if (Test-Path $p) { try { (ConvertFrom-Json (Get-Content -Raw $p)).client_id } catch { $null } }
 }
 
+# The authenticated user's numeric Looker id, or $null. Used to deep-link to
+# that user's own API-key admin page, which is keyed by id.
+function Get-LookerUserId([string]$id, [string]$secret) {
+    try {
+        $body = 'client_id={0}&client_secret={1}' -f [Uri]::EscapeDataString($id), [Uri]::EscapeDataString($secret)
+        $login = Invoke-RestMethod -Uri "$BaseUrl/api/4.0/login" -Method Post -Body $body `
+            -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 20
+        if (-not $login.access_token) { return $null }
+        $me = Invoke-RestMethod -Uri "$BaseUrl/api/4.0/user?fields=id" `
+            -Headers @{ Authorization = "token $($login.access_token)" } -TimeoutSec 20
+        if ($me.id) { return [string]$me.id }
+    } catch {}
+    return $null
+}
+
+# The user's own API-key page when the id resolves, else the self-service
+# account page (no id, works for everyone).
+function Get-ApiKeyUrl([string]$id, [string]$secret) {
+    $uid = Get-LookerUserId $id $secret
+    if ($uid) { return "$BaseUrl/admin/next/users/api3_key/$uid" }
+    return "$BaseUrl/account"
+}
+
 function Request-Credentials {
     Step 'Connecting your Foreman Intelligence account'
 
@@ -303,14 +326,19 @@ function Request-Credentials {
     Write-Host ''
     Write-Host '  In the page that opens:'
     Write-Host '    1. Sign in if asked'
-    Write-Host '    2. Authentication section -> Manage (API keys)'
+    Write-Host '    2. Find the API keys / Authentication section (click Manage if shown)'
     Write-Host '    3. Create a new API key, then copy the Client ID and Client Secret'
     Write-Host ''
-    Write-Host '  No "Manage" button? Your account cannot create API keys yet. Ask your'
+    Write-Host '  No API-key option? Your account cannot create API keys yet. Ask your'
     Write-Host '  Foreman Intelligence admin, then run this installer again.'
     Write-Host ''
+    # Deep-link to this user's own API-key page when a prior key resolves their
+    # id; otherwise the self-service account page.
+    $openUrl = "$BaseUrl/account"
+    $prevId = Get-SavedClientId; $prevSecret = Read-SecretFile
+    if ($prevId -and $prevSecret) { $openUrl = Get-ApiKeyUrl $prevId $prevSecret }
     [void](Read-Host '  Press Enter to open Foreman Intelligence in your browser')
-    try { Start-Process "$BaseUrl/account" } catch { LogWarn "Couldn't open a browser. Go to $BaseUrl/account" }
+    try { Start-Process $openUrl } catch { LogWarn "Couldn't open a browser. Go to $openUrl" }
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Write-Host ''
@@ -470,7 +498,7 @@ function Register-ClaudeDesktop {
     }
 }
 
-function Complete-Install {
+function Complete-Install($creds) {
     Step 'Done'
     Write-Host ''
     Write-Host '  Foreman Intelligence is connected. Try asking Claude:'
@@ -480,6 +508,12 @@ function Complete-Install {
     Write-Host ''
     if ($script:WantCode)    { Write-Host '  Claude Code: start a new session with `claude` (type /mcp to see the connector).' }
     if ($script:WantDesktop) { Write-Host '  Claude Desktop: open a new chat.' }
+    $uid = Get-LookerUserId $creds.id $creds.secret
+    if ($uid) {
+        Write-Host ''
+        Write-Host "  Manage or rotate this key anytime:"
+        Write-Host "    $BaseUrl/admin/next/users/api3_key/$uid"
+    }
     Write-Host ''
     Write-Host '  Something off later? Run the same install command again; it repairs itself.' -ForegroundColor DarkGray
     Write-Host '  New API key: -Reconfigure. Remove everything: -Uninstall.' -ForegroundColor DarkGray
@@ -584,7 +618,7 @@ function Invoke-Main {
     Invoke-SmokeTest
     Register-ClaudeCode
     Register-ClaudeDesktop
-    Complete-Install
+    Complete-Install $creds
 }
 
 Invoke-Main
