@@ -36,10 +36,29 @@ $GoodId     = 'test-client-id'
 $GoodSecret = 's3cret "with" odd&chars %PATH%'
 $Sentinel   = '%USERPROFILE%\fi-path-sentinel'
 
-$HomeDir   = Join-Path $Work 'home'            # stands in for %USERPROFILE%
-$ClaudeDir = Join-Path $HomeDir '.local\bin'   # where Anthropic's installer puts claude
-$FiHome    = Join-Path $Work 'foreman-intelligence'
-$Launcher  = Join-Path $FiHome 'bin\foreman-intelligence-mcp.ps1'
+$HomeDir    = Join-Path $Work 'home'            # stands in for %USERPROFILE%
+$ClaudeDir  = Join-Path $HomeDir '.local\bin'   # where Anthropic's installer puts claude
+$FiHome     = Join-Path $Work 'foreman-intelligence'
+$Launcher   = Join-Path $FiHome 'bin\foreman-intelligence-mcp.ps1'
+$DesktopCfg = Join-Path $Work 'Claude\claude_desktop_config.json'
+$Cafe       = "Caf$([char]0xE9)"                # non-ASCII text that must survive a rewrite
+$Utf8NoBom  = New-Object Text.UTF8Encoding $false
+
+# ---------------------------------------------------------------- Desktop config
+
+function Read-Utf8([string]$path) { [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) }
+function Get-DesktopServer([string]$path, [string]$name) { (ConvertFrom-Json (Read-Utf8 $path)).mcpServers.PSObject.Properties[$name] }
+function Test-NoBom([string]$path) {
+    $b = [IO.File]::ReadAllBytes($path)
+    -not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+}
+# A config as Claude Desktop saves it: UTF-8 without a BOM, holding another
+# server, a setting and non-ASCII text.
+function Write-DesktopSeed([string]$path) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+    $json = '{ "mcpServers": { "other-server": { "command": "where.exe", "args": [] } }, "preferences": { "sidebarMode": "chat" }, "note": "' + $Cafe + '" }'
+    [IO.File]::WriteAllText($path, $json, $Utf8NoBom)
+}
 
 # ---------------------------------------------------------------- user PATH
 
@@ -65,12 +84,13 @@ function Get-Calls {
 
 # Runs the installer the way `irm | iex` does: piped into Invoke-Expression in
 # a fresh Windows PowerShell, so the installer and the session share a scope.
-function Invoke-Installer([hashtable]$extra = @{}) {
+# $prelude runs first in that session, e.g. to stand in for Windows commands.
+function Invoke-Installer([hashtable]$extra = @{}, [string]$prelude = '') {
     $vars = @{
         USERPROFILE             = $HomeDir
         FI_HOME                 = $FiHome
         FI_CLAUDE_DIR           = (Join-Path $HomeDir '.claude')
-        FI_DESKTOP_CONFIG       = (Join-Path $Work 'Claude\claude_desktop_config.json')
+        FI_DESKTOP_CONFIG       = $DesktopCfg
         FI_BASE_URL             = "http://127.0.0.1:$Port"
         FI_TOOLBOX_URL          = "http://127.0.0.1:$Port/toolbox.exe"
         FI_TOOLBOX_SHA256       = $ToolboxSha
@@ -85,6 +105,7 @@ function Invoke-Installer([hashtable]$extra = @{}) {
     Remove-Item -Force (Join-Path $ClaudeDir 'calls.log') -ErrorAction SilentlyContinue
 
     $cmd = @"
+$prelude
 try { Get-Content -Raw -LiteralPath '$Installer' | Invoke-Expression }
 catch { 'INSTALLER STOPPED: ' + `$_.Exception.Message; `$_.InvocationInfo.PositionMessage; exit 1 }
 if (Get-Command claude -ErrorAction SilentlyContinue) { 'CLAUDE ON SESSION PATH' }
@@ -228,8 +249,9 @@ server.serve_forever()
 
     # ------------------------------------------------------------ tests
 
-    Write-Host 'Fresh install: Claude Code installed but not on PATH, nothing registered yet'
-    Invoke-Installer
+    Write-Host 'Fresh install into both apps: Claude Code not on PATH and nothing registered yet'
+    Write-DesktopSeed $DesktopCfg
+    Invoke-Installer @{ FI_TARGET = 'both' }
     Check 'installer exits 0' { $script:ExitCode -eq 0 }
     Check 'runs to the end' { $script:Out -match 'Foreman Intelligence is connected' }
     Check "smoke test counted the stub's tools" { $script:Out -match 'Claude will have 3 Foreman Intelligence tools' }
@@ -244,9 +266,15 @@ server.serve_forever()
     Check 'secret never printed' { -not $script:Out.Contains($GoodSecret) }
     Check 'secret not in the install log' { -not (Get-Content -Raw (Join-Path $FiHome 'install.log')).Contains($GoodSecret) }
     Check 'prints direct API-key URL with resolved id' { $script:Out -match 'admin/next/users/api3_key/43' }
+    Check 'desktop config has the new server' { Get-DesktopServer $DesktopCfg 'foreman-intelligence' }
+    Check 'desktop config kept the other server' { Get-DesktopServer $DesktopCfg 'other-server' }
+    Check 'desktop config kept other settings' { (ConvertFrom-Json (Read-Utf8 $DesktopCfg)).preferences.sidebarMode -eq 'chat' }
+    Check 'desktop config kept non-ASCII text intact' { (ConvertFrom-Json (Read-Utf8 $DesktopCfg)).note -eq $Cafe }
+    Check 'desktop config written without a BOM' { Test-NoBom $DesktopCfg }
+    Check 'desktop config was backed up' { Test-Path "$DesktopCfg.bak-foreman-intelligence" }
 
     Write-Host 'Re-run repairs in place'
-    Invoke-Installer
+    Invoke-Installer @{ FI_TARGET = 'both' }
     Check 'second run exits 0' { $script:ExitCode -eq 0 }
     Check 'toolbox not downloaded again' { $script:Out -match 'Already installed and verified' }
     Check 'saved key reused' { $script:Out -match 'Saved API key still works' }
@@ -261,11 +289,61 @@ server.serve_forever()
     Check 'install folder removed' { -not (Test-Path $FiHome) }
     Check 'skill removed' { -not (Test-Path (Join-Path $HomeDir '.claude\skills\foreman-intelligence')) }
     Check 'PATH left alone (Claude Code still lives there)' { (Get-PathCount $ClaudeDir) -eq 1 }
+    Check 'removed from Claude Desktop' { -not (Get-DesktopServer $DesktopCfg 'foreman-intelligence') }
+    Check 'other desktop server kept' { Get-DesktopServer $DesktopCfg 'other-server' }
 
     Write-Host 'Uninstall with nothing registered in Claude Code'
     Invoke-Installer @{ FI_UNINSTALL = '1' }
     Check 'uninstall exits 0' { $script:ExitCode -eq 0 }
     Check "doesn't claim a removal" { $script:Out -notmatch 'Removed from Claude Code' }
+
+    # The installer from claude.ai/download puts Claude Desktop in an MSIX
+    # package. Windows keeps what the app writes under %APPDATA% in the
+    # package's folder, and the app reads its config there, so on a PC like
+    # this %APPDATA%\Claude doesn't exist at all.
+    Write-Host 'Only Claude Desktop, installed from claude.ai (MSIX)'
+    $MsixHome  = Join-Path $Work 'home-msix'
+    $MsixLocal = Join-Path $MsixHome 'AppData\Local'
+    $MsixRoam  = Join-Path $MsixHome 'AppData\Roaming'
+    $MsixFi    = Join-Path $MsixLocal 'foreman-intelligence'
+    $PkgCfg    = Join-Path $MsixLocal 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json'
+    $RoamCfg   = Join-Path $MsixRoam 'Claude\claude_desktop_config.json'
+    New-Item -ItemType Directory -Force -Path $MsixRoam | Out-Null
+    Write-DesktopSeed $PkgCfg
+    $msixEnv = @{
+        USERPROFILE = $MsixHome; LOCALAPPDATA = $MsixLocal; APPDATA = $MsixRoam
+        FI_HOME = $MsixFi; FI_CLAUDE_DIR = (Join-Path $MsixHome '.claude'); FI_DESKTOP_CONFIG = $null; FI_TARGET = 'auto'
+    }
+    # Windows reports the package; Claude Code isn't installed and must not be.
+    $msixMocks = @'
+function global:Get-AppxPackage { [pscustomobject]@{ Name = 'Claude'; PackageFamilyName = 'Claude_pzs8sxrjxfjjc'; PackageFullName = 'Claude_2.31226.1.0_x64__pzs8sxrjxfjjc'; Publisher = 'CN=Anthropic, PBC' } }
+function global:Invoke-RestMethod { if ("$args" -match 'claude\.ai/install') { throw 'test: tried to install Claude Code' }; Microsoft.PowerShell.Utility\Invoke-RestMethod @args }
+'@
+    Invoke-Installer $msixEnv $msixMocks
+    Check 'installer exits 0' { $script:ExitCode -eq 0 }
+    Check 'finds Claude Desktop' { $script:Out -match 'Claude Desktop found' }
+    Check "doesn't install Claude Code instead" { $script:Out -notmatch 'Installing Claude Code' }
+    Check 'connector added to the config the app reads' { Get-DesktopServer $PkgCfg 'foreman-intelligence' }
+    Check 'runs the launcher' { @((Get-DesktopServer $PkgCfg 'foreman-intelligence').Value.args) -contains (Join-Path $MsixFi 'bin\foreman-intelligence-mcp.ps1') }
+    Check "kept the app's other server" { Get-DesktopServer $PkgCfg 'other-server' }
+    Check "kept the app's settings and text" { $j = ConvertFrom-Json (Read-Utf8 $PkgCfg); $j.preferences.sidebarMode -eq 'chat' -and $j.note -eq $Cafe }
+    Check 'written without a BOM' { Test-NoBom $PkgCfg }
+    Check "didn't create %APPDATA%\Claude" { -not (Test-Path (Split-Path $RoamCfg)) }
+
+    Write-Host 'Same PC after "Edit Config" made %APPDATA%\Claude: both copies get it'
+    New-Item -ItemType Directory -Force -Path (Split-Path $RoamCfg) | Out-Null
+    [IO.File]::WriteAllText($RoamCfg, '{}', $Utf8NoBom)
+    Invoke-Installer $msixEnv $msixMocks
+    Check 're-run exits 0' { $script:ExitCode -eq 0 }
+    Check 'package copy still has the connector' { Get-DesktopServer $PkgCfg 'foreman-intelligence' }
+    Check '%APPDATA% copy has it too' { Get-DesktopServer $RoamCfg 'foreman-intelligence' }
+
+    Write-Host 'Uninstall cleans both copies'
+    Invoke-Installer ($msixEnv + @{ FI_UNINSTALL = '1' }) $msixMocks
+    Check 'uninstall exits 0' { $script:ExitCode -eq 0 }
+    Check 'removed from the package copy' { -not (Get-DesktopServer $PkgCfg 'foreman-intelligence') }
+    Check 'removed from the %APPDATA% copy' { -not (Get-DesktopServer $RoamCfg 'foreman-intelligence') }
+    Check "the app's other server kept" { Get-DesktopServer $PkgCfg 'other-server' }
 } finally {
     if ($PathSaved) {
         $k = Open-EnvKey $true
