@@ -36,7 +36,7 @@ Set-StrictMode -Version 2.0
 # Windows PowerShell 5.1, especially when stdout is redirected.
 $ProgressPreference = 'SilentlyContinue'
 
-$FiVersion = '0.1.2'
+$FiVersion = '0.1.3'
 
 $ToolboxVersion = '1.13.1'
 # Published by Google in the v1.13.1 release notes (googleapis/mcp-toolbox).
@@ -56,6 +56,7 @@ $DesktopCfg = if ($env:FI_DESKTOP_CONFIG){ $env:FI_DESKTOP_CONFIG }else { Join-P
 $ToolboxUrlOverride = $env:FI_TOOLBOX_URL
 $ToolboxShaOverride = $env:FI_TOOLBOX_SHA256
 $ClaudeBinOverride  = $env:FI_CLAUDE_BIN
+$DesktopCfgOverride = $env:FI_DESKTOP_CONFIG
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 
@@ -64,6 +65,7 @@ $script:Launcher   = $null
 $script:ClaudeBin  = $null
 $script:WantCode   = $false
 $script:WantDesktop = $false
+$script:DesktopPackage = $null
 
 # ---------------------------------------------------------------- output
 
@@ -190,10 +192,68 @@ function Add-ClaudeToPath {
     if (-not (Test-OnPath $env:Path $dir)) { $env:Path = $env:Path.TrimEnd(';') + ';' + $dir }
 }
 
+# Claude Desktop from claude.ai/download (and the Microsoft Store) is an MSIX
+# package. It runs packaged: Windows keeps what it writes under %APPDATA% in the
+# package's own folder and it reads its config from there, so with only this
+# install %APPDATA%\Claude may not exist (anthropics/claude-code#26073).
+function Find-ClaudeDesktopPackage {
+    try {
+        return (Get-AppxPackage -Name '*Claude' -ErrorAction Stop |
+            Where-Object { $_.PackageFamilyName -eq 'Claude_pzs8sxrjxfjjc' -or $_.Publisher -match 'Anthropic' } |
+            Select-Object -First 1)
+    } catch {
+        # Get-AppxPackage can be unavailable (Server Core, constrained language
+        # mode); the package's folder for the app's data is the next best sign.
+        if (Test-Path (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude')) {
+            return [pscustomobject]@{ PackageFamilyName = 'Claude_pzs8sxrjxfjjc'; PackageFullName = $null }
+        }
+        return $null
+    }
+}
+
 function Test-ClaudeDesktop {
+    [bool]$script:DesktopPackage -or
     (Test-Path (Split-Path $DesktopCfg)) -or
     (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe')) -or
     (Test-Path (Join-Path $env:LOCALAPPDATA 'AnthropicClaude'))
+}
+
+# Every claude_desktop_config.json Claude Desktop may read: the package's copy
+# for the MSIX app, and %APPDATA%\Claude's, which the classic install reads and
+# which "Edit Config" opens even in the MSIX app.
+function Get-DesktopConfigPaths {
+    if ($DesktopCfgOverride) { return @($DesktopCfgOverride) }
+    $paths = @()
+    if ($script:DesktopPackage) {
+        $paths += Join-Path $env:LOCALAPPDATA "Packages\$($script:DesktopPackage.PackageFamilyName)\LocalCache\Roaming\Claude\claude_desktop_config.json"
+    }
+    if (-not $script:DesktopPackage -or (Test-Path (Split-Path $DesktopCfg))) { $paths += $DesktopCfg }
+    return $paths
+}
+
+# Claude Desktop's processes. Claude Code's CLI is claude.exe too, so go by
+# where the exe lives, never by the name alone.
+function Get-ClaudeDesktopProcess {
+    Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object {
+        $exe = $null
+        try { $exe = $_.Path } catch { }
+        $exe -and ($exe -match '\\WindowsApps\\(AnthropicPBC\.)?Claude_' -or $exe -match '\\AnthropicClaude\\' -or $exe -match '\\Programs\\Claude\\')
+    }
+}
+
+# Returns whether Claude Desktop was started.
+function Start-ClaudeDesktop {
+    if ($script:DesktopPackage) {
+        # A packaged app has to be started by its app id, not its exe.
+        $appId = 'Claude'
+        try { $appId = @((Get-AppxPackageManifest -Package $script:DesktopPackage.PackageFullName).Package.Applications.Application)[0].Id } catch { }
+        Start-Process "shell:AppsFolder\$($script:DesktopPackage.PackageFamilyName)!$appId"
+        return $true
+    }
+    foreach ($exe in @((Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'))) {
+        if (Test-Path $exe) { Start-Process $exe; return $true }
+    }
+    return $false
 }
 
 # Reads a JSON config file into a PSCustomObject, or an empty one when
@@ -202,7 +262,8 @@ function Test-ClaudeDesktop {
 # faithfully; a hashtable conversion turns empty arrays into empty objects.
 function Read-JsonConfig([string]$path) {
     if (-not (Test-Path $path)) { return (New-Object PSObject) }
-    $text = Get-Content -Raw -Path $path
+    # Claude writes UTF-8 without a BOM, which 5.1 would otherwise read as ANSI.
+    $text = Get-Content -Raw -Encoding UTF8 -Path $path
     if ([string]::IsNullOrWhiteSpace($text)) { return (New-Object PSObject) }
     try { return ($text | ConvertFrom-Json) } catch { return $null }
 }
@@ -219,7 +280,9 @@ function Set-Prop($obj, [string]$name, $value) {
 function Write-JsonConfig([string]$path, $tree) {
     $dir = Split-Path $path
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    ($tree | ConvertTo-Json -Depth 20) | Out-File -Encoding utf8 -FilePath $path
+    # Without a BOM: 5.1's Out-File -Encoding utf8 adds one, and Claude's JSON
+    # parser rejects the file over it (anthropics/claude-code#81355).
+    [IO.File]::WriteAllText($path, ($tree | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding $false))
 }
 
 # ---------------------------------------------------------------- stages
@@ -236,6 +299,7 @@ function Select-Targets {
     Step 'Finding Claude'
     $script:ClaudeBin = Find-ClaudeCode
     if ($script:ClaudeBin) { LogOk "Claude Code found at $script:ClaudeBin" }
+    $script:DesktopPackage = Find-ClaudeDesktopPackage
     $haveDesktop = Test-ClaudeDesktop
     if ($haveDesktop) { LogOk 'Claude Desktop found' }
 
@@ -516,33 +580,44 @@ function Install-Skill {
 function Register-ClaudeDesktop {
     if (-not $script:WantDesktop) { return }
     Step 'Connecting Claude Desktop'
-    $tree = Read-JsonConfig $DesktopCfg
-    if ($null -eq $tree) { Fail "Claude Desktop's config file isn't valid JSON, so it was left untouched: $DesktopCfg" }
-    if (Test-Path $DesktopCfg) { Copy-Item -Force $DesktopCfg "$DesktopCfg.bak-foreman-intelligence"; Note 'desktop config backed up' }
-
-    $servers = Get-Prop $tree 'mcpServers'
-    if ($null -eq $servers) { $servers = New-Object PSObject; Set-Prop $tree 'mcpServers' $servers }
-    Set-Prop $servers $ServerName ([pscustomobject]@{
-        command = 'powershell.exe'
-        args    = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Launcher)
-    })
-    Write-JsonConfig $DesktopCfg $tree
-    LogOk "Added `"$ServerName`" to Claude Desktop"
-
-    foreach ($name in $LegacyServerNames) {
-        if ($name -ne $ServerName -and (Get-Prop $servers $name)) {
-            LogWarn "An older `"$name`" connector from the manual setup is also in Claude Desktop."
-            Write-Host '  Remove it in Settings -> Developer -> Edit Config so Claude sees one copy of each tool.'
-        }
+    # Check every config before changing any.
+    $paths = @(Get-DesktopConfigPaths)
+    $trees = @{}
+    foreach ($path in $paths) {
+        $trees[$path] = Read-JsonConfig $path
+        if ($null -eq $trees[$path]) { Fail "Claude Desktop's config file isn't valid JSON, so it was left untouched: $path" }
     }
 
-    if ((Get-Process -Name Claude -ErrorAction SilentlyContinue) -and (Test-Interactive)) {
+    $legacy = @()
+    foreach ($path in $paths) {
+        $tree = $trees[$path]
+        if (Test-Path $path) { Copy-Item -Force $path "$path.bak-foreman-intelligence"; Note "desktop config backed up: $path" }
+        $servers = Get-Prop $tree 'mcpServers'
+        if ($null -eq $servers) { $servers = New-Object PSObject; Set-Prop $tree 'mcpServers' $servers }
+        Set-Prop $servers $ServerName ([pscustomobject]@{
+            command = 'powershell.exe'
+            args    = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:Launcher)
+        })
+        Write-JsonConfig $path $tree
+        Note "desktop config written: $path"
+        foreach ($name in $LegacyServerNames) {
+            if ($name -ne $ServerName -and (Get-Prop $servers $name)) { $legacy += [pscustomobject]@{ name = $name; path = $path } }
+        }
+    }
+    LogOk "Added `"$ServerName`" to Claude Desktop"
+
+    # Named by file: in the MSIX app, Edit Config opens a copy the app ignores.
+    foreach ($l in $legacy) {
+        LogWarn "An older `"$($l.name)`" connector from the manual setup is also in Claude Desktop."
+        Write-Host "  Remove it from $($l.path) so Claude sees one copy of each tool."
+    }
+
+    if ((Get-ClaudeDesktopProcess) -and (Test-Interactive)) {
         if (Confirm-Yes 'Claude Desktop is open. Restart it now to load the connector?' $true) {
-            Get-Process -Name Claude -ErrorAction SilentlyContinue | Stop-Process -Force
+            Get-ClaudeDesktopProcess | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
-            $exe = Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'
-            if (Test-Path $exe) { Start-Process $exe }
-            LogOk 'Claude Desktop restarted'
+            if (Start-ClaudeDesktop) { LogOk 'Claude Desktop restarted' }
+            else { LogWarn 'Claude Desktop was closed. Open it again to load the connector.' }
         } else { LogWarn 'Fully quit Claude Desktop and reopen it to load the connector.' }
     }
 }
@@ -581,16 +656,20 @@ function Invoke-Uninstall {
         if ($LASTEXITCODE -eq 0) { LogOk 'Removed from Claude Code' }
     }
 
-    $tree = Read-JsonConfig $DesktopCfg
-    if ($null -eq $tree) { LogWarn "Claude Desktop's config isn't valid JSON; remove `"$ServerName`" by hand." }
-    else {
+    $script:DesktopPackage = Find-ClaudeDesktopPackage
+    $removedDesktop = $false
+    foreach ($path in @(Get-DesktopConfigPaths)) {
+        if (-not (Test-Path $path)) { continue }
+        $tree = Read-JsonConfig $path
+        if ($null -eq $tree) { LogWarn "Claude Desktop's config isn't valid JSON; remove `"$ServerName`" by hand: $path"; continue }
         $servers = Get-Prop $tree 'mcpServers'
         if ($servers -and $servers.PSObject.Properties[$ServerName]) {
             $servers.PSObject.Properties.Remove($ServerName)
-            Write-JsonConfig $DesktopCfg $tree
-            LogOk 'Removed from Claude Desktop (restart it to finish)'
+            Write-JsonConfig $path $tree
+            $removedDesktop = $true
         }
     }
+    if ($removedDesktop) { LogOk 'Removed from Claude Desktop (restart it to finish)' }
 
     $skill = Join-Path $ClaudeDir 'skills\foreman-intelligence'
     if (Test-Path $skill) { Remove-Item -Recurse -Force $skill; LogOk 'Removed the Claude Code skill' }

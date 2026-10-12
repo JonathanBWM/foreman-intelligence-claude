@@ -59,7 +59,7 @@ Re-running without flags repairs in place.
 | Config | `~/.foreman-intelligence/config.env` | `%LOCALAPPDATA%\foreman-intelligence\config.json` |
 | Secret | Keychain `foreman-intelligence-looker` | DPAPI `…\foreman-intelligence\secret.dpapi` |
 | MCP (Code) | `foreman-intelligence` user scope | same |
-| MCP (Desktop) | `claude_desktop_config.json` | `%APPDATA%\Claude\claude_desktop_config.json` |
+| MCP (Desktop) | `claude_desktop_config.json` | `%APPDATA%\Claude\claude_desktop_config.json`, and for the MSIX app the package's copy (see Notes) |
 | Skill | `~/.claude/skills/foreman-intelligence/` | `%USERPROFILE%\.claude\skills\foreman-intelligence\` |
 | PATH | unchanged | Claude Code's folder (`%USERPROFILE%\.local\bin`) added to the user PATH if missing; kept on uninstall |
 | Log | `~/.foreman-intelligence/install.log` | `%LOCALAPPDATA%\foreman-intelligence\install.log` |
@@ -67,6 +67,7 @@ Re-running without flags repairs in place.
 ## Notes
 
 - Legacy `looker-toolbox` connectors from the manual setup will cause duplicate tool registration. Remove them.
+- Claude Desktop from claude.ai/download on Windows is an MSIX package. It reads its config from `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json`, while its Edit Config button opens the copy in `%APPDATA%\Claude\` ([anthropics/claude-code#26073](https://github.com/anthropics/claude-code/issues/26073)). The installer finds the package and writes the connector to both.
 
 ---
 
