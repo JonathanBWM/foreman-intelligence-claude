@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-FI_VERSION="0.1.1"
+FI_VERSION="0.1.2"
 
 TOOLBOX_VERSION="1.13.1"
 # Published by Google in the v1.13.1 release notes (googleapis/mcp-toolbox).

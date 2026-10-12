@@ -61,6 +61,7 @@ Re-running without flags repairs in place.
 | MCP (Code) | `foreman-intelligence` user scope | same |
 | MCP (Desktop) | `claude_desktop_config.json` | `%APPDATA%\Claude\claude_desktop_config.json` |
 | Skill | `~/.claude/skills/foreman-intelligence/` | `%USERPROFILE%\.claude\skills\foreman-intelligence\` |
+| PATH | unchanged | Claude Code's folder (`%USERPROFILE%\.local\bin`) added to the user PATH if missing; kept on uninstall |
 | Log | `~/.foreman-intelligence/install.log` | `%LOCALAPPDATA%\foreman-intelligence\install.log` |
 
 ## Notes
@@ -74,10 +75,11 @@ Re-running without flags repairs in place.
 ### Tests
 
 ```bash
-bash tests/run.sh
+bash tests/run.sh                                        # macOS
+powershell -ExecutionPolicy Bypass -File tests\run.ps1   # Windows PowerShell 5.1
 ```
 
-Throwaway `$HOME`, mock Keychain, fake Looker, stub binaries. CI runs on macOS with ShellCheck. The PowerShell installer was validated on a throwaway Windows 10 VM (install, repair, uninstall, DPAPI round-trip). CI lints it with PSScriptAnalyzer.
+`run.sh`: throwaway `$HOME`, mock Keychain, fake Looker, stub binaries. `run.ps1` runs `install.ps1` the way `irm | iex` does, against a fake Looker, a stub `toolbox.exe` and a stub `claude` that behaves like the real one; it edits your user PATH and restores it. CI runs both (Windows under PowerShell 5.1, not pwsh), plus ShellCheck and PSScriptAnalyzer.
 
 ### Releases
 

@@ -36,7 +36,7 @@ Set-StrictMode -Version 2.0
 # Windows PowerShell 5.1, especially when stdout is redirected.
 $ProgressPreference = 'SilentlyContinue'
 
-$FiVersion = '0.1.1'
+$FiVersion = '0.1.2'
 
 $ToolboxVersion = '1.13.1'
 # Published by Google in the v1.13.1 release notes (googleapis/mcp-toolbox).
@@ -155,6 +155,41 @@ function Find-ClaudeCode {
     $null
 }
 
+function Test-OnPath([string]$pathList, [string]$dir) {
+    $want = $dir.TrimEnd('\')
+    foreach ($entry in ($pathList -split ';')) {
+        if ([Environment]::ExpandEnvironmentVariables($entry).Trim().TrimEnd('\') -eq $want) { return $true }
+    }
+    return $false
+}
+
+# Anthropic's Windows installer puts claude.exe in %USERPROFILE%\.local\bin but
+# leaves that folder off PATH, so `claude` isn't found in a new terminal. Add it
+# to the user PATH, and to this session, which `irm | iex` shares with the user.
+function Add-ClaudeToPath {
+    if ($ClaudeBinOverride -or (Get-Command claude -ErrorAction SilentlyContinue)) { return }
+    $dir = Split-Path $script:ClaudeBin
+    $added = $false
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    try {
+        # Read and write the raw value. Going through [Environment] would expand
+        # entries like %USERPROFILE%\... for good and save them as REG_SZ.
+        $userPath = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if (-not (Test-OnPath $userPath $dir)) {
+            $newPath = if ($userPath.Trim()) { $userPath.TrimEnd(';') + ';' + $dir } else { $dir }
+            $key.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $added = $true
+        }
+    } finally { if ($key) { $key.Close() } }
+    if ($added) {
+        # Deleting an unset user variable changes nothing but broadcasts
+        # WM_SETTINGCHANGE, so Explorer hands new terminals the new PATH.
+        [Environment]::SetEnvironmentVariable('FOREMAN_INTELLIGENCE_UNSET', $null, 'User')
+        LogOk "Added $dir to your PATH, so the claude command works in new terminals"
+    }
+    if (-not (Test-OnPath $env:Path $dir)) { $env:Path = $env:Path.TrimEnd(';') + ';' + $dir }
+}
+
 function Test-ClaudeDesktop {
     (Test-Path (Split-Path $DesktopCfg)) -or
     (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe')) -or
@@ -228,6 +263,11 @@ function Select-Targets {
         $script:ClaudeBin = Find-ClaudeCode
         if (-not $script:ClaudeBin) { Fail "Claude Code installed but the claude command wasn't found. Open a new terminal and run this again." }
         LogOk 'Claude Code installed'
+    }
+
+    if ($script:WantCode) {
+        try { Add-ClaudeToPath }
+        catch { Note "PATH update failed: $($_.Exception.Message)"; LogWarn "Couldn't add Claude Code to your PATH. Run it as $script:ClaudeBin" }
     }
 }
 
@@ -439,8 +479,14 @@ function Invoke-SmokeTest {
 function Register-ClaudeCode {
     if (-not $script:WantCode) { return }
     Step 'Connecting Claude Code'
+    # On a first install there is nothing to remove, and claude says so on
+    # stderr with exit 1. Same trap as the smoke test: under Stop, PowerShell
+    # 5.1 makes redirected native stderr a terminating error. Relax it for the
+    # claude calls and go by the exit code.
+    $ErrorActionPreference = 'Continue'
     & $script:ClaudeBin mcp remove $ServerName --scope user 2>&1 | Out-Null
     & $script:ClaudeBin mcp add $ServerName --scope user -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:Launcher 2>&1 | Out-File -Append -Encoding utf8 $script:LogFile
+    $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE -ne 0) { Fail 'Could not register with Claude Code.' }
     LogOk "Added `"$ServerName`" for every Claude Code project"
 
@@ -527,7 +573,13 @@ function Invoke-Uninstall {
     if (-not (Confirm-Yes 'Remove the connector, its saved API key and its settings?' $true)) { Write-Host 'Nothing removed.'; return }
 
     $cb = Find-ClaudeCode
-    if ($cb) { & $cb mcp remove $ServerName --scope user 2>&1 | Out-Null; LogOk 'Removed from Claude Code' }
+    if ($cb) {
+        # Not registered is reported on stderr; see Register-ClaudeCode.
+        $ErrorActionPreference = 'Continue'
+        & $cb mcp remove $ServerName --scope user 2>&1 | Out-Null
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE -eq 0) { LogOk 'Removed from Claude Code' }
+    }
 
     $tree = Read-JsonConfig $DesktopCfg
     if ($null -eq $tree) { LogWarn "Claude Desktop's config isn't valid JSON; remove `"$ServerName`" by hand." }
