@@ -116,7 +116,10 @@ function Confirm-Yes([string]$question, [bool]$default) {
 
 # ---------------------------------------------------------------- secret (DPAPI)
 
-function Protect-Secret([string]$plain) {
+function Protect-Secret {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'The plaintext is the secret being stored; it is DPAPI-encrypted on the next line.')]
+    param([string]$plain)
     # DPAPI CurrentUser: only this Windows account can decrypt.
     $ss = ConvertTo-SecureString -String $plain -AsPlainText -Force
     ConvertFrom-SecureString -SecureString $ss
