@@ -19,6 +19,14 @@ jobs:
       - run: /bin/bash -n install.sh   # macOS's bash 3.2, what `curl | bash` usually gets
       - run: bash tests/run.sh
 
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: End-to-end tests
+        shell: powershell   # Windows PowerShell 5.1, what `irm | iex` gets
+        run: .\tests\run.ps1
+
   lint-powershell:
     runs-on: windows-latest
     steps:
